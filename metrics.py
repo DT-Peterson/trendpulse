@@ -1,15 +1,39 @@
+import os
+import json
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 
-CLAUDE_API_KEY = 'YOUR_CLAUDE_API_KEY'
-TELEGRAM_BOT_TOKEN = 'YOUR_KIMI_BOT_TOKEN'
-TELEGRAM_CHAT_ID = 'YOUR_TELEGRAM_CHAT_ID'
-KIMI_BOT_TOKEN = 'YOUR_KIMI_BOT_TOKEN'
-YOUTUBE_API_KEY = 'YOUR_YOUTUBE_API_KEY'
-YOUTUBE_CHANNEL_ID = 'YOUR_YOUTUBE_CHANNEL_ID'
+# --- Load from .env ---
+SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+ENV_PATH = os.path.join(SCRIPTS_DIR, '.env')
+
+def load_env():
+    """Load .env file manually (no external deps needed)."""
+    env = {}
+    if os.path.exists(ENV_PATH):
+        with open(ENV_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, val = line.split('=', 1)
+                    env[key.strip()] = val.strip()
+                    os.environ[key.strip()] = val.strip()
+    return env
+
+load_env()
+
+CLAUDE_API_KEY = os.environ.get('CLAUDE_API_KEY', '')
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
+YOUTUBE_API_KEY = os.environ.get('YOUTUBE_API_KEY', '')
+YOUTUBE_CHANNEL_ID = os.environ.get('YOUTUBE_CHANNEL_ID', '')
+
+# OpenClaw Kimi bot for second opinion (if configured)
+KIMI_BOT_TOKEN = os.environ.get('KIMI_BOT_TOKEN', '')
+
 
 def get_channel_stats():
-    url = f'https://www.googleapis.com/youtube/v3/channels'
+    url = 'https://www.googleapis.com/youtube/v3/channels'
     params = {
         'part': 'statistics',
         'id': YOUTUBE_CHANNEL_ID,
@@ -18,8 +42,9 @@ def get_channel_stats():
     response = requests.get(url, params=params)
     return response.json()
 
+
 def get_recent_videos():
-    url = f'https://www.googleapis.com/youtube/v3/search'
+    url = 'https://www.googleapis.com/youtube/v3/search'
     params = {
         'part': 'snippet',
         'channelId': YOUTUBE_CHANNEL_ID,
@@ -31,26 +56,61 @@ def get_recent_videos():
     response = requests.get(url, params=params)
     return response.json()
 
+
 def get_video_stats(video_ids):
-    url = f'https://www.googleapis.com/youtube/v3/videos'
+    url = 'https://www.googleapis.com/youtube/v3/videos'
     params = {
-        'part': 'statistics',
+        'part': 'statistics,contentDetails',
         'id': ','.join(video_ids),
         'key': YOUTUBE_API_KEY
     }
     response = requests.get(url, params=params)
     return response.json()
 
-def send_telegram_message(text):
+
+def send_telegram_message(text, bot_token=None):
+    token = bot_token or TELEGRAM_BOT_TOKEN
+    if not token or token.startswith('YOUR_'):
+        print(f'Skipping Telegram send (token not configured)')
+        return
     requests.post(
-        f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage',
+        f'https://api.telegram.org/bot{token}/sendMessage',
         json={
             'chat_id': TELEGRAM_CHAT_ID,
             'text': text,
             'parse_mode': 'Markdown'
         }
     )
-def get_claude_analysis(report):
+
+
+def get_run_history():
+    """Load pipeline run history for context in analysis."""
+    log_path = '/tmp/trendpulse_runs.jsonl'
+    runs = []
+    if os.path.exists(log_path):
+        with open(log_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        runs.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+    return runs[-14:]  # Last 14 runs (1 week of 2x daily)
+
+
+def get_claude_analysis(report, run_history):
+    history_text = ''
+    if run_history:
+        recent_topics = [r.get('topic', '?') for r in run_history[-7:]]
+        voices_used = [r.get('voiceStyle', '?') for r in run_history[-7:]]
+        approved_count = sum(1 for r in run_history if r.get('approved'))
+        history_text = f"""
+Recent topics posted: {', '.join(recent_topics)}
+Voice styles used: {', '.join(voices_used)}
+Approval rate: {approved_count}/{len(run_history)} ({100*approved_count//max(len(run_history),1)}%)
+"""
+
     response = requests.post(
         'https://api.anthropic.com/v1/messages',
         headers={
@@ -60,72 +120,106 @@ def get_claude_analysis(report):
         },
         json={
             'model': 'claude-sonnet-4-20250514',
-            'max_tokens': 1000,
+            'max_tokens': 1200,
             'messages': [{
                 'role': 'user',
-                'content': f'''You are a social media growth strategist for TrendPulse, a short form video channel posting daily to TikTok, YouTube Shorts and Instagram Reels.
+                'content': f"""You are a short-form video growth strategist for TrendPulse, a faceless AI content channel posting 2x daily to TikTok, YouTube Shorts, and Instagram Reels.
 
-Here are the latest channel metrics:
+Channel metrics:
 {report}
 
-Based on these metrics provide:
-1. What is working and why
-2. What needs improvement
-3. Specific recommendations for tomorrows video topic and hook style
-4. One actionable tip to increase retention
+Pipeline history:
+{history_text}
 
-Keep response concise and actionable. Use plain text no markdown.'''
+Provide a concise analysis:
+1. PERFORMANCE: What's working and what isn't (cite specific numbers)
+2. HOOK QUALITY: Based on recent topics, are hooks likely grabbing attention in first 3 seconds?
+3. TOPIC STRATEGY: Are we chasing trends too late or hitting them early? Suggest topic timing improvements.
+4. TOMORROW'S PLAY: Specific topic category + hook style to try tomorrow
+5. ONE CHANGE: The single highest-impact change to make this week for more views
+
+Keep it actionable. No filler. Plain text, no markdown."""
             }]
         }
     )
     data = response.json()
     return data['content'][0]['text']
+
+
 def main():
     print('Fetching YouTube metrics...')
-    
-    channel_data = get_channel_stats()
-    
-    if 'items' not in channel_data or not channel_data['items']:
-        send_telegram_message('❌ Could not fetch YouTube metrics. Check API key and channel ID.')
+
+    # Validate config
+    if not YOUTUBE_API_KEY or YOUTUBE_API_KEY.startswith('YOUR_'):
+        send_telegram_message('⚠️ YouTube API key not configured in .env')
+        print('ERROR: YOUTUBE_API_KEY not set')
         return
-    
+
+    if not YOUTUBE_CHANNEL_ID or YOUTUBE_CHANNEL_ID.startswith('UC') and 'x' in YOUTUBE_CHANNEL_ID:
+        send_telegram_message('⚠️ YouTube Channel ID not configured in .env — update YOUTUBE_CHANNEL_ID')
+        print('ERROR: YOUTUBE_CHANNEL_ID not set properly')
+        return
+
+    channel_data = get_channel_stats()
+
+    if 'items' not in channel_data or not channel_data['items']:
+        err = channel_data.get('error', {}).get('message', 'Unknown error')
+        send_telegram_message(f'❌ YouTube API error: {err}')
+        print(f'YouTube API error: {json.dumps(channel_data, indent=2)}')
+        return
+
     stats = channel_data['items'][0]['statistics']
     total_views = int(stats.get('viewCount', 0))
     total_subs = int(stats.get('subscriberCount', 0))
     total_videos = int(stats.get('videoCount', 0))
-    
+
     videos_data = get_recent_videos()
     video_ids = [item['id']['videoId'] for item in videos_data.get('items', [])]
-    
-    report = f"📊 *TrendPulse Weekly Report*\n"
-    report += f"_{datetime.now().strftime('%B %d, %Y')}_\n\n"
-    report += f"*Channel Overview:*\n"
-    report += f"👁 Total Views: {total_views:,}\n"
-    report += f"👥 Subscribers: {total_subs:,}\n"
-    report += f"🎬 Total Videos: {total_videos}\n\n"
-    
+
+    report = f"📊 TrendPulse Report\n"
+    report += f"{datetime.now().strftime('%B %d, %Y')}\n\n"
+    report += f"Channel Overview:\n"
+    report += f"  Views: {total_views:,}\n"
+    report += f"  Subscribers: {total_subs:,}\n"
+    report += f"  Videos: {total_videos}\n\n"
+
     if video_ids:
         video_stats = get_video_stats(video_ids)
-        report += "*Recent Video Performance:*\n"
-        
-        for i, item in enumerate(video_stats.get('items', [])[:5], 1):
+        report += "Recent Videos:\n"
+
+        for i, item in enumerate(video_stats.get('items', [])[:7], 1):
             vid_stats = item['statistics']
             views = int(vid_stats.get('viewCount', 0))
             likes = int(vid_stats.get('likeCount', 0))
             comments = int(vid_stats.get('commentCount', 0))
             video_id = item['id']
-            report += f"{i}. 👁 {views:,} views | 👍 {likes} | 💬 {comments} | youtube.com/shorts/{video_id}\n"
-    
-    report += "\n*Kimi Analysis Needed:*\n"
-    report += "Review above metrics and suggest improvements for tomorrow's video topic and hook style."
-    
+
+            # Calculate engagement rate
+            eng_rate = ((likes + comments) / max(views, 1)) * 100
+
+            report += f"  {i}. {views:,} views | {likes} likes | {comments} comments | {eng_rate:.1f}% eng\n"
+            report += f"     youtube.com/shorts/{video_id}\n"
+
     print(report)
-    send_telegram_message(report)
-    analysis = get_claude_analysis(report)
-    send_telegram_message(f"🧠 *Claude Analysis:*\n\n{analysis}")
-    requests.post(f'https://api.telegram.org/bot{KIMI_BOT_TOKEN}/sendMessage', json={'chat_id': TELEGRAM_CHAT_ID, 'text': report, 'parse_mode': 'Markdown'})
-    requests.post(f'https://api.telegram.org/bot{KIMI_BOT_TOKEN}/sendMessage', json={'chat_id': TELEGRAM_CHAT_ID, 'text': 'Based on the metrics above, what improvements should we make to tomorrows video topic, hook style and script format to increase views and retention?'})
-    print('Metrics sent to Telegram!')
+
+    # Send report
+    send_telegram_message(f"📊 *TrendPulse Report*\n\n{report}")
+
+    # Get Claude analysis with run history
+    run_history = get_run_history()
+    analysis = get_claude_analysis(report, run_history)
+    send_telegram_message(f"🧠 *Analysis:*\n\n{analysis}")
+
+    # Send to Kimi bot for second opinion (if configured)
+    if KIMI_BOT_TOKEN and not KIMI_BOT_TOKEN.startswith('YOUR_'):
+        send_telegram_message(report, bot_token=KIMI_BOT_TOKEN)
+        send_telegram_message(
+            'Based on these metrics, what improvements should we make to topic selection, hook style, and video format to increase views and retention?',
+            bot_token=KIMI_BOT_TOKEN
+        )
+
+    print('Metrics sent!')
+
 
 if __name__ == '__main__':
     main()

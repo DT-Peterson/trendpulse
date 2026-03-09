@@ -1,13 +1,14 @@
+require('dotenv').config({ path: __dirname + '/.env' });
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 const fs = require('fs');
 const { execSync } = require('child_process');
 
-const CLAUDE_API_KEY = 'YOUR_CLAUDE_API_KEY';
-const ELEVENLABS_API_KEY = 'sk_2ee3de86bd9a3579a99e4bcb8f40df9f6b3dc73bfc393371';
-const TAISLY_API_KEY = 'YOUR_TAISLY_API_KEY';
-const TELEGRAM_BOT_TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN';
-const TELEGRAM_CHAT_ID = '5914663399';
-const VOICE_ID = '21m00Tcm4TlvDq8ikWAM';
+// --- Config from .env ---
+const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const TAISLY_API_KEY = process.env.TAISLY_API_KEY;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 const PLATFORM_IDS = [
   '69a93ca768be3afaed6028b3',
@@ -15,28 +16,76 @@ const PLATFORM_IDS = [
   '69a93cca68be3afaed6028ea'
 ];
 
+// --- Voice rotation: news, hype, storytelling ---
+const VOICES = [
+  { id: '21m00Tcm4TlvDq8ikWAM', name: 'Rachel', style: 'news', stability: 0.85, similarity: 0.80, styleVal: 0.15 },
+  { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Bella', style: 'hype', stability: 0.70, similarity: 0.85, styleVal: 0.45 },
+  { id: 'ErXwobaYiN019PkySvjV', name: 'Antoni', style: 'storytelling', stability: 0.80, similarity: 0.75, styleVal: 0.30 }
+];
+
+const TOPIC_VOICE_MAP = {
+  news: ['politics', 'economy', 'government', 'law', 'policy', 'election', 'war', 'climate'],
+  hype: ['viral', 'challenge', 'celebrity', 'music', 'sports', 'nfl', 'nba', 'movie', 'game', 'bitcoin', 'crypto', 'tesla'],
+  storytelling: ['science', 'health', 'ai', 'space', 'history', 'food', 'travel', 'nature', 'weather']
+};
+
+function pickVoice(topic) {
+  const lower = topic.toLowerCase();
+  for (const [style, keywords] of Object.entries(TOPIC_VOICE_MAP)) {
+    if (keywords.some(k => lower.includes(k))) {
+      return VOICES.find(v => v.style === style);
+    }
+  }
+  return VOICES[Math.floor(Math.random() * VOICES.length)];
+}
+
+// --- Trend sourcing: Google Trends + Reddit Rising ---
 async function getTrendingTopics() {
-  const response = await fetch('https://trends.google.com/trends/trendingsearches/daily/rss?geo=US', {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
-  });
-  const text = await response.text();
   const topics = [];
-  const regex = /<title><!\[CDATA\[(.+?)\]\]><\/title>/g;
-  let match;
-  while ((match = regex.exec(text)) !== null) {
-    if (match[1] !== 'Daily Search Trends') {
-      topics.push(match[1]);
+
+  // Source 1: Google Trends RSS
+  try {
+    const gRes = await fetch('https://trends.google.com/trends/trendingsearches/daily/rss?geo=US', {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+    });
+    const gText = await gRes.text();
+    const regex = /<title><!\[CDATA\[(.+?)\]\]><\/title>/g;
+    let match;
+    while ((match = regex.exec(gText)) !== null) {
+      if (match[1] !== 'Daily Search Trends') topics.push({ source: 'google', topic: match[1] });
     }
-  }
+  } catch (e) { console.error('Google Trends fetch failed:', e.message); }
+
+  // Source 2: Reddit Rising (r/all) — catches trends 4-6 hours earlier
+  try {
+    const rRes = await fetch('https://www.reddit.com/r/all/rising.json?limit=10', {
+      headers: { 'User-Agent': 'TrendPulse/1.0' }
+    });
+    const rData = await rRes.json();
+    if (rData?.data?.children) {
+      for (const post of rData.data.children.slice(0, 10)) {
+        const title = post.data.title;
+        if (title && title.length > 10 && title.length < 120) {
+          topics.push({ source: 'reddit', topic: title });
+        }
+      }
+    }
+  } catch (e) { console.error('Reddit fetch failed:', e.message); }
+
   if (topics.length === 0) {
-    return ['Taylor Swift', 'NFL', 'Bitcoin', 'AI news', 'Tesla', 'viral challenge', 'celebrity drama', 'stock market crash', 'new movie release', 'sports highlights'];
+    return [
+      { source: 'fallback', topic: 'AI news' },
+      { source: 'fallback', topic: 'Bitcoin' },
+      { source: 'fallback', topic: 'viral challenge' },
+      { source: 'fallback', topic: 'celebrity drama' },
+      { source: 'fallback', topic: 'stock market' }
+    ];
   }
-  return topics.slice(0, 10);
+  return topics.slice(0, 20);
 }
 
 async function getBestTopic(topics) {
+  const topicList = topics.map(t => `[${t.source}] ${t.topic}`).join('\n');
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -46,26 +95,29 @@ async function getBestTopic(topics) {
     },
     body: JSON.stringify({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 1000,
+      max_tokens: 300,
       messages: [{
         role: 'user',
-        content: `Here are today's top trending topics in order of search volume: ${topics.join(', ')}. 
+        content: `You are a viral content strategist for short-form video (TikTok, YouTube Shorts, Instagram Reels).
 
-Analyze which ONE topic has the most viral potential for a 30-60 second faceless video on TikTok, YouTube Shorts and Instagram Reels.
+Here are today's trending topics from multiple sources:
+${topicList}
 
-Prioritize topics that are:
-- RISING fast (just starting to trend, not yet peaked)
-- Have broad appeal (not too niche)
-- Emotionally engaging (shocking, inspiring, controversial, or funny)
-- Can be covered quickly before the trend dies
+Pick the ONE topic with the highest viral potential for a 30-60 second faceless AI voiceover video.
 
-Avoid topics that:
-- Are already oversaturated
-- Peaked more than 6 hours ago
-- Are too politically divisive
-- Could violate community guidelines
+Prioritize:
+- Reddit rising topics (these are 4-6 hours ahead of Google Trends)
+- Emotionally engaging: shocking, inspiring, controversial, or funny
+- Broad appeal across demographics
+- Can be explained in 30-60 seconds without visuals of specific people
 
-Reply with ONLY the topic name, nothing else.`
+Avoid:
+- Topics that peaked more than 12 hours ago
+- Extremely niche topics
+- Anything requiring face-cam or specific footage
+- Topics that could violate community guidelines
+
+Reply with ONLY the topic name (cleaned up, concise), nothing else.`
       }]
     })
   });
@@ -86,27 +138,31 @@ async function generateScript(topic) {
       max_tokens: 1000,
       messages: [{
         role: 'user',
-        content: `Write a 30-60 second viral video script about: ${topic}.
+        content: `Write a 30-60 second voiceover script for a faceless short-form video about: ${topic}
 
-Choose the BEST hook formula from these proven viral formats:
-- "You won't believe what just happened with [topic]..."
-- "Stop doing X, here's what actually works..."
-- "POV: You just discovered [topic]..."
-- "This [common thing] is a scam, here's the truth..."
-- "I tried [topic] for 30 days, here's what happened..."
-- "Nobody is talking about this [topic] secret..."
-- "The [topic] trick that changed everything..."
+HOOK (first 3 seconds — this is everything):
+Choose the best hook style for this specific topic:
+- Pattern interrupt: Start mid-thought as if continuing a conversation
+- Bold claim: State something counterintuitive that demands proof
+- Direct address: "If you [specific situation], stop scrolling"
+- Shock stat: Lead with a number that sounds wrong but is true
+- Story open: "So this just happened..." or "I need to tell you about..."
 
-Rules:
-- Pick the hook that fits the topic best
-- Hook must grab attention in first 3 seconds
-- Fast paced, punchy sentences, one idea per line
-- Conversational tone like talking to a friend
-- Build curiosity throughout, don't reveal everything upfront
-- End with strong call to action (follow, comment, share)
-- Written for AI voiceover, no stage directions
-- Plain text only, no labels or headers
-- Maximum 150 words`
+DO NOT use these overused hooks:
+- "You won't believe..."
+- "Nobody is talking about..."
+- "What they don't want you to know..."
+- Any hook that sounds like a 2023 AI video
+
+SCRIPT RULES:
+- Conversational, like texting a friend who's smart
+- Short punchy sentences. One idea per line.
+- Add [pause] markers where the speaker should breathe (every 2-3 sentences)
+- Build tension: reveal information progressively, save the best detail for the end
+- End with a specific CTA: ask a question that demands a comment, or tell them to follow for part 2
+- Plain text only. No labels, headers, or stage directions except [pause]
+- Maximum 140 words
+- Write for AUDIO — this will be read aloud by AI, make it sound natural spoken`
       }]
     })
   });
@@ -127,15 +183,16 @@ async function generateHashtags(topic) {
       max_tokens: 200,
       messages: [{
         role: 'user',
-        content: `Generate optimized hashtags for a short form video about: ${topic}.
+        content: `Generate hashtags for a short form video about: ${topic}
 
 Rules:
-- Generate exactly 10 hashtags
-- Mix of large (3), medium (4), and niche (3) hashtags
+- 12 hashtags total
+- 3 large volume: #viral #trending #fyp #foryou (pick 3)
+- 4 medium: topic-relevant hashtags with 100K-10M posts
+- 3 niche: specific to this exact topic, lower competition
+- 2 engagement: #debate #thoughts #didyouknow #learnontiktok (pick 2)
 - All lowercase with # symbol
-- Relevant to the topic and trending on TikTok/YouTube/Instagram
-- Include at least one broad hashtag like #viral #trending #fyp
-- Return ONLY the hashtags separated by spaces, nothing else`
+- Return ONLY hashtags separated by spaces`
       }]
     })
   });
@@ -143,20 +200,26 @@ Rules:
   return data.content[0].text.trim();
 }
 
-async function generateVoiceover(script) {
-  const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`, {
+async function generateVoiceover(script, topic) {
+  const voice = pickVoice(topic);
+  console.log(`Using voice: ${voice.name} (${voice.style}) for topic: ${topic}`);
+
+  // Strip [pause] markers — ElevenLabs handles pacing via SSML-like breaks
+  const cleanScript = script.replace(/\[pause\]/gi, '... ');
+
+  const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voice.id}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'xi-api-key': ELEVENLABS_API_KEY
     },
     body: JSON.stringify({
-      text: script,
+      text: cleanScript,
       model_id: 'eleven_turbo_v2_5',
       voice_settings: {
-        stability: 0.85,
-        similarity_boost: 0.80,
-        style: 0.25,
+        stability: voice.stability,
+        similarity_boost: voice.similarity,
+        style: voice.styleVal,
         use_speaker_boost: true
       }
     })
@@ -171,12 +234,12 @@ async function generateVoiceover(script) {
   }
   const path = `/tmp/voiceover_${Date.now()}.mp3`;
   fs.writeFileSync(path, Buffer.from(buffer));
-  return path;
+  return { path, voiceName: voice.name, voiceStyle: voice.style };
 }
 
 async function assembleVideo(audioPath, topic) {
   const outputPath = `/tmp/final_video_${Date.now()}.mp4`;
-  execSync(`python3 ~/.openclaw/skills/video-pipeline/scripts/assemble_video.py ${audioPath} ${outputPath} "${topic}"`);
+  execSync(`python3 ~/.openclaw/skills/video-pipeline/scripts/assemble_video.py "${audioPath}" "${outputPath}" "${topic.replace(/"/g, '\\"')}"`);
   return outputPath;
 }
 
@@ -193,16 +256,23 @@ async function sendTelegramMessage(text) {
 }
 
 async function sendTelegramVideo(videoPath, caption) {
-  const FormData = (await import('formdata-node')).FormData;
-  const { fileFromPath } = await import('formdata-node/file-from-path');
-  const form = new FormData();
-  form.set('chat_id', TELEGRAM_CHAT_ID);
-  form.set('caption', caption);
-  form.set('video', await fileFromPath(videoPath));
-  await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo`, {
-    method: 'POST',
-    body: form
-  });
+  try {
+    const FormData = (await import('formdata-node')).FormData;
+    const { fileFromPath } = await import('formdata-node/file-from-path');
+    const form = new FormData();
+    form.set('chat_id', TELEGRAM_CHAT_ID);
+    form.set('caption', caption);
+    form.set('video', await fileFromPath(videoPath, { type: 'video/mp4' }));
+    const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo`, {
+      method: 'POST',
+      body: form
+    });
+    const data = await response.json();
+    if (!data.ok) throw new Error('Telegram sendVideo failed: ' + JSON.stringify(data));
+  } catch (error) {
+    console.error('sendTelegramVideo error: ' + error.message);
+    throw error;
+  }
 }
 
 async function postToSocials(videoPath, topic) {
@@ -212,7 +282,7 @@ async function postToSocials(videoPath, topic) {
   const form = new FormData();
   form.set('platforms', JSON.stringify(PLATFORM_IDS));
   const hashtags = await generateHashtags(topic);
-  form.set('description', `${topic} 🔥 Follow for daily trending content! ${hashtags}`);
+  form.set('description', `${topic} | Follow for daily trending content! ${hashtags}`);
   form.set('video', await fileFromPath(videoPath, { type: 'video/mp4' }));
   const response = await fetch('https://app.taisly.com/api/private/post', {
     method: 'POST',
@@ -241,7 +311,7 @@ async function waitForApproval(topic) {
         if (data.result && data.result.length > 0) {
           for (const update of data.result) {
             offset = update.update_id + 1;
-            const text = update.message?.text;
+            const text = update.message?.text?.toLowerCase();
             if (text === '✅' || text === 'yes' || text === 'approve') {
               clearInterval(interval);
               resolve(true);
@@ -258,6 +328,7 @@ async function waitForApproval(topic) {
       }
     }, 3000);
 
+    // 10 minute timeout
     setTimeout(() => {
       clearInterval(interval);
       resolve(false);
@@ -265,37 +336,60 @@ async function waitForApproval(topic) {
   });
 }
 
+// --- Main pipeline ---
 async function main() {
   try {
-    await sendTelegramMessage('🔍 Starting daily video pipeline...');
+    await sendTelegramMessage('🔍 Starting video pipeline...');
+
     console.log('Fetching trending topics...');
     const topics = await getTrendingTopics();
-    console.log('Found topics: ' + topics.join(', '));
+    const googleCount = topics.filter(t => t.source === 'google').length;
+    const redditCount = topics.filter(t => t.source === 'reddit').length;
+    console.log(`Found ${topics.length} topics (Google: ${googleCount}, Reddit: ${redditCount})`);
+
     console.log('Selecting best topic...');
     const bestTopic = await getBestTopic(topics);
     console.log('Best topic: ' + bestTopic);
-    await sendTelegramMessage(`🎯 Today's topic: *${bestTopic}*\n\nWriting script...`);
+    await sendTelegramMessage(`🎯 Topic: *${bestTopic}*\nSources: Google(${googleCount}) Reddit(${redditCount})\n\nWriting script...`);
+
     console.log('Writing script...');
     const script = await generateScript(bestTopic);
-    console.log('Script written');
+    console.log('Script written (' + script.split(' ').length + ' words)');
+
     console.log('Generating voiceover...');
-    const audioPath = await generateVoiceover(script);
-    console.log('Voiceover done: ' + audioPath);
-    await sendTelegramMessage('🎙️ Voiceover generated! Assembling video...');
+    const { path: audioPath, voiceName, voiceStyle } = await generateVoiceover(script, bestTopic);
+    console.log(`Voiceover done (${voiceName}/${voiceStyle}): ${audioPath}`);
+    await sendTelegramMessage(`🎙️ Voice: ${voiceName} (${voiceStyle})\nAssembling video...`);
+
     console.log('Assembling video...');
     const videoPath = await assembleVideo(audioPath, bestTopic);
     console.log('Video done: ' + videoPath);
-    await sendTelegramVideo(videoPath, `📹 *${bestTopic}*\n\nReply ✅ to post to all platforms or ❌ to skip`);
+
+    await sendTelegramVideo(videoPath, `📹 *${bestTopic}*\nVoice: ${voiceName} (${voiceStyle})\n\nReply ✅ to post or ❌ to skip`);
+
     const approved = await waitForApproval(bestTopic);
     if (approved) {
-      await sendTelegramMessage('✅ Approved! Posting to TikTok, YouTube and Instagram...');
+      await sendTelegramMessage('✅ Posting to TikTok, YouTube and Instagram...');
       await postToSocials(videoPath, bestTopic);
-      await sendTelegramMessage('🎉 Posted to all platforms successfully!');
+      await sendTelegramMessage('🎉 Posted to all platforms!');
     } else {
-      await sendTelegramMessage('❌ Skipped. Run again tomorrow!');
+      await sendTelegramMessage('❌ Skipped.');
     }
+
+    // Log run for metrics tracking
+    const logEntry = {
+      date: new Date().toISOString(),
+      topic: bestTopic,
+      voice: voiceName,
+      voiceStyle,
+      approved,
+      sources: { google: googleCount, reddit: redditCount }
+    };
+    const logPath = '/tmp/trendpulse_runs.jsonl';
+    fs.appendFileSync(logPath, JSON.stringify(logEntry) + '\n');
+
   } catch (error) {
-    console.error('Error: ' + error.message);
+    console.error('Pipeline error: ' + error.message);
     await sendTelegramMessage(`❌ Pipeline error: ${error.message}`);
   }
 }
