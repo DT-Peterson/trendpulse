@@ -7,3 +7,7 @@ __pycache__/
 *.bak
 *.bak2
 backups/
+user_clips/inbox/*
+!user_clips/inbox/.gitkeep
+user_clips/used/*
+!user_clips/used/.gitkeep

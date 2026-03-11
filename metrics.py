@@ -155,7 +155,8 @@ def main():
         print('ERROR: YOUTUBE_API_KEY not set')
         return
 
-    if not YOUTUBE_CHANNEL_ID or YOUTUBE_CHANNEL_ID.startswith('UC') and 'x' in YOUTUBE_CHANNEL_ID:
+    valid_channel_id = bool(YOUTUBE_CHANNEL_ID) and YOUTUBE_CHANNEL_ID.startswith('UC') and len(YOUTUBE_CHANNEL_ID) >= 20
+    if not valid_channel_id:
         send_telegram_message('⚠️ YouTube Channel ID not configured in .env — update YOUTUBE_CHANNEL_ID')
         print('ERROR: YOUTUBE_CHANNEL_ID not set properly')
         return

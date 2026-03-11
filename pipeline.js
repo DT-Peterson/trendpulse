@@ -1,7 +1,8 @@
 require('dotenv').config({ path: __dirname + '/.env' });
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 const fs = require('fs');
-const { execSync } = require('child_process');
+const path = require('path');
+const { execFileSync } = require('child_process');
 
 // --- Config from .env ---
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
@@ -15,6 +16,67 @@ const PLATFORM_IDS = [
   '69a93cbe68be3afaed6028da',
   '69a93cca68be3afaed6028ea'
 ];
+
+const USER_CLIP_ROOT = path.join(__dirname, 'user_clips');
+const USER_CLIP_INBOX = path.join(USER_CLIP_ROOT, 'inbox');
+const USER_CLIP_USED = path.join(USER_CLIP_ROOT, 'used');
+const USER_CLIP_EXTENSIONS = new Set(['.mp4', '.mov', '.m4v', '.webm']);
+const LAYOUT2_PROBABILITY = Math.min(Math.max(Number.parseFloat(process.env.LAYOUT2_PROBABILITY || '0.5') || 0, 0), 1);
+
+function ensureUserClipDirectories() {
+  for (const dir of [USER_CLIP_ROOT, USER_CLIP_INBOX, USER_CLIP_USED]) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+function listAvailableUserClips() {
+  ensureUserClipDirectories();
+  return fs.readdirSync(USER_CLIP_INBOX, { withFileTypes: true })
+    .filter((entry) => entry.isFile())
+    .map((entry) => path.join(USER_CLIP_INBOX, entry.name))
+    .filter((filePath) => USER_CLIP_EXTENSIONS.has(path.extname(filePath).toLowerCase()))
+    .sort((a, b) => fs.statSync(a).mtimeMs - fs.statSync(b).mtimeMs);
+}
+
+function chooseLayoutDecision(probability = LAYOUT2_PROBABILITY) {
+  const availableClips = listAvailableUserClips();
+  if (!availableClips.length) {
+    return {
+      layout: 'option1',
+      userClip: null,
+      reason: 'no unused user clip available'
+    };
+  }
+
+  if (Math.random() < probability) {
+    return {
+      layout: 'option2',
+      userClip: availableClips[0],
+      reason: 'unused user clip available'
+    };
+  }
+
+  return {
+    layout: 'option1',
+    userClip: null,
+    reason: 'standard layout chosen this run'
+  };
+}
+
+function markUserClipUsed(userClipPath) {
+  ensureUserClipDirectories();
+  const basename = path.basename(userClipPath);
+  const targetPath = path.join(USER_CLIP_USED, `${Date.now()}_${basename}`);
+  fs.renameSync(userClipPath, targetPath);
+  return targetPath;
+}
+
+function describeLayout(decision) {
+  if (decision.layout === 'option2') {
+    return `Option 2 (split layout)${decision.userClip ? ` using ${path.basename(decision.userClip)}` : ''}`;
+  }
+  return 'Option 1 (standard layout)';
+}
 
 // --- Voice rotation: news, hype, storytelling ---
 const VOICES = [
@@ -140,7 +202,7 @@ async function generateScript(topic) {
         role: 'user',
         content: `Write a 30-60 second voiceover script for a faceless short-form video about: ${topic}
 
-HOOK (first 3 seconds — this is everything):
+HOOK (first 3 seconds - this is everything):
 Choose the best hook style for this specific topic:
 - Pattern interrupt: Start mid-thought as if continuing a conversation
 - Bold claim: State something counterintuitive that demands proof
@@ -162,12 +224,38 @@ SCRIPT RULES:
 - End with a specific CTA: ask a question that demands a comment, or tell them to follow for part 2
 - Plain text only. No labels, headers, or stage directions except [pause]
 - Maximum 140 words
-- Write for AUDIO — this will be read aloud by AI, make it sound natural spoken`
+- Write for AUDIO - this will be read aloud by AI, make it sound natural spoken`
       }]
     })
   });
   const data = await response.json();
-  return data.content[0].text.trim();
+  return sanitizeScript(data.content[0].text.trim(), topic);
+}
+
+function sanitizeScript(script, topic) {
+  const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const escapedTopic = escapeRegex(topic);
+  const topicOnly = new RegExp(`^\\s*["'()\\[\\]#>*-]*${escapedTopic}["'()\\[\\]#>*-]*\\s*$`, 'i');
+  const labelLine = /^(hook|topic|title|script|voiceover|caption)\\s*[:.-]?\\s*/i;
+
+  const cleanedLines = script
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => line.replace(labelLine, '').trim())
+    .filter((line) => line.length > 0)
+    .filter((line) => !topicOnly.test(line));
+
+  let cleaned = cleanedLines.join('\n');
+  cleaned = cleaned.replace(/^(hook|topic|title|script|voiceover|caption)\b[.: -]*/i, '');
+  cleaned = cleaned.replace(/^about\s*:\s*/i, '');
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
+
+  if (!cleaned) {
+    throw new Error('Generated script was empty after cleanup');
+  }
+
+  return cleaned;
 }
 
 async function generateHashtags(topic) {
@@ -237,9 +325,21 @@ async function generateVoiceover(script, topic) {
   return { path, voiceName: voice.name, voiceStyle: voice.style };
 }
 
-async function assembleVideo(audioPath, topic) {
+async function assembleVideo(audioPath, topic, layoutDecision) {
   const outputPath = `/tmp/final_video_${Date.now()}.mp4`;
-  execSync(`python3 ~/.openclaw/skills/video-pipeline/scripts/assemble_video.py "${audioPath}" "${outputPath}" "${topic.replace(/"/g, '\\"')}"`);
+  const args = [
+    path.join(__dirname, 'assemble_video.py'),
+    '--audio', audioPath,
+    '--output', outputPath,
+    '--topic', topic,
+    '--layout', layoutDecision.layout
+  ];
+
+  if (layoutDecision.userClip) {
+    args.push('--user-clip', layoutDecision.userClip);
+  }
+
+  execFileSync('python3', args, { stdio: 'inherit' });
   return outputPath;
 }
 
@@ -339,8 +439,11 @@ async function waitForApproval(topic) {
 // --- Main pipeline ---
 async function main() {
   try {
-    await sendTelegramMessage('🔍 Starting video pipeline...');
+    ensureUserClipDirectories();
+    const requestedLayout = chooseLayoutDecision();
+    await sendTelegramMessage(`Starting video pipeline...\nFormat requested: ${describeLayout(requestedLayout)}`);
 
+    console.log(`Requested format: ${describeLayout(requestedLayout)} (${requestedLayout.reason})`);
     console.log('Fetching trending topics...');
     const topics = await getTrendingTopics();
     const googleCount = topics.filter(t => t.source === 'google').length;
@@ -350,7 +453,7 @@ async function main() {
     console.log('Selecting best topic...');
     const bestTopic = await getBestTopic(topics);
     console.log('Best topic: ' + bestTopic);
-    await sendTelegramMessage(`🎯 Topic: *${bestTopic}*\nSources: Google(${googleCount}) Reddit(${redditCount})\n\nWriting script...`);
+    await sendTelegramMessage(`Topic: *${bestTopic}*\nSources: Google(${googleCount}) Reddit(${redditCount})\n\nWriting script...`);
 
     console.log('Writing script...');
     const script = await generateScript(bestTopic);
@@ -359,30 +462,56 @@ async function main() {
     console.log('Generating voiceover...');
     const { path: audioPath, voiceName, voiceStyle } = await generateVoiceover(script, bestTopic);
     console.log(`Voiceover done (${voiceName}/${voiceStyle}): ${audioPath}`);
-    await sendTelegramMessage(`🎙️ Voice: ${voiceName} (${voiceStyle})\nAssembling video...`);
+    await sendTelegramMessage(`Voice: ${voiceName} (${voiceStyle})\nFormat: ${describeLayout(requestedLayout)}\nAssembling video...`);
 
     console.log('Assembling video...');
-    const videoPath = await assembleVideo(audioPath, bestTopic);
+    let resolvedLayout = requestedLayout;
+    let videoPath;
+    try {
+      videoPath = await assembleVideo(audioPath, bestTopic, resolvedLayout);
+    } catch (error) {
+      if (requestedLayout.layout === 'option2') {
+        console.warn(`Option 2 failed with ${requestedLayout.userClip}: ${error.message}`);
+        await sendTelegramMessage('Option 2 failed with the uploaded clip. Retrying Option 1...');
+        resolvedLayout = {
+          layout: 'option1',
+          userClip: null,
+          reason: 'fallback after option2 failure'
+        };
+        videoPath = await assembleVideo(audioPath, bestTopic, resolvedLayout);
+      } else {
+        throw error;
+      }
+    }
     console.log('Video done: ' + videoPath);
 
-    await sendTelegramVideo(videoPath, `📹 *${bestTopic}*\nVoice: ${voiceName} (${voiceStyle})\n\nReply ✅ to post or ❌ to skip`);
+    let consumedClipPath = null;
+    if (resolvedLayout.layout === 'option2' && requestedLayout.userClip) {
+      consumedClipPath = markUserClipUsed(requestedLayout.userClip);
+      console.log(`Marked user clip as used: ${consumedClipPath}`);
+    }
+
+    const clipLabel = consumedClipPath ? `\nClip: ${path.basename(consumedClipPath)}` : '';
+    await sendTelegramVideo(videoPath, `Video ready: *${bestTopic}*\nVoice: ${voiceName} (${voiceStyle})\nFormat: ${describeLayout(resolvedLayout)}${clipLabel}\n\nReply YES or NO`);
 
     const approved = await waitForApproval(bestTopic);
     if (approved) {
-      await sendTelegramMessage('✅ Posting to TikTok, YouTube and Instagram...');
+      await sendTelegramMessage('Posting to TikTok, YouTube and Instagram...');
       await postToSocials(videoPath, bestTopic);
-      await sendTelegramMessage('🎉 Posted to all platforms!');
+      await sendTelegramMessage('Posted to all platforms!');
     } else {
-      await sendTelegramMessage('❌ Skipped.');
+      await sendTelegramMessage('Skipped.');
     }
 
-    // Log run for metrics tracking
     const logEntry = {
       date: new Date().toISOString(),
       topic: bestTopic,
       voice: voiceName,
       voiceStyle,
       approved,
+      layoutRequested: requestedLayout.layout,
+      layoutUsed: resolvedLayout.layout,
+      userClipRequested: requestedLayout.userClip ? path.basename(requestedLayout.userClip) : null,
       sources: { google: googleCount, reddit: redditCount }
     };
     const logPath = '/tmp/trendpulse_runs.jsonl';
@@ -390,8 +519,21 @@ async function main() {
 
   } catch (error) {
     console.error('Pipeline error: ' + error.message);
-    await sendTelegramMessage(`❌ Pipeline error: ${error.message}`);
+    await sendTelegramMessage(`Pipeline error: ${error.message}`);
   }
 }
 
-main();
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  ensureUserClipDirectories,
+  listAvailableUserClips,
+  chooseLayoutDecision,
+  markUserClipUsed,
+  describeLayout,
+  sanitizeScript,
+  assembleVideo
+};
+

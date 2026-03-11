@@ -1,4 +1,5 @@
 import sys
+import argparse
 import os
 import json
 import subprocess
@@ -15,33 +16,73 @@ BG_MUSIC_URLS = [
     'https://cdn.pixabay.com/audio/2022/05/27/audio_1808fbf07a.mp3',  # soft beats
 ]
 
+def generate_local_bg_music(output_path):
+    """Generate a simple local ambient fallback track so the pipeline never depends on remote audio hosts."""
+    print('Generating local ambient fallback track...')
+    tmp_path = output_path + '.tmp.mp3'
+    subprocess.run([
+        'ffmpeg', '-y',
+        '-f', 'lavfi', '-i', 'sine=frequency=220:sample_rate=44100:duration=90',
+        '-f', 'lavfi', '-i', 'sine=frequency=330:sample_rate=44100:duration=90',
+        '-filter_complex', '[0:a]volume=0.018[a0];[1:a]volume=0.012[a1];[a0][a1]amix=inputs=2:duration=longest,lowpass=f=1200,highpass=f=120,volume=1.5[aout]',
+        '-map', '[aout]',
+        '-c:a', 'libmp3lame',
+        '-b:a', '128k',
+        tmp_path
+    ], check=True, capture_output=True)
+    os.replace(tmp_path, output_path)
+    return output_path
+
+
 def download_bg_music():
-    """Download a random background music track if not cached."""
+    """Download a background music track if available, otherwise generate a reliable local fallback."""
     cache_dir = '/tmp/trendpulse_music'
     os.makedirs(cache_dir, exist_ok=True)
 
-    idx = random.randint(0, len(BG_MUSIC_URLS) - 1)
-    cached = os.path.join(cache_dir, f'bg_{idx}.mp3')
-    if os.path.exists(cached) and os.path.getsize(cached) > 10000:
-        return cached
+    cached_tracks = [
+        os.path.join(cache_dir, name)
+        for name in os.listdir(cache_dir)
+        if name.startswith('bg_') and name.endswith('.mp3')
+    ]
+    usable_cached = [path for path in cached_tracks if os.path.getsize(path) > 10000]
+    if usable_cached:
+        return random.choice(sorted(usable_cached))
+
+    indices = list(range(len(BG_MUSIC_URLS)))
+    random.shuffle(indices)
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36',
+        'Referer': 'https://pixabay.com/',
+    }
+
+    for idx in indices:
+        cached = os.path.join(cache_dir, f'bg_{idx}.mp3')
+        try:
+            print(f'Downloading background music track {idx}...')
+            req = urllib.request.Request(BG_MUSIC_URLS[idx], headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                with open(cached, 'wb') as f:
+                    f.write(resp.read())
+            if os.path.getsize(cached) > 10000:
+                return cached
+        except Exception as e:
+            print(f'Background music download failed for track {idx}: {e}')
+
+    fallback = os.path.join(cache_dir, 'bg_fallback.mp3')
+    if os.path.exists(fallback) and os.path.getsize(fallback) > 10000:
+        return fallback
 
     try:
-        print(f'Downloading background music track {idx}...')
-        req = urllib.request.Request(BG_MUSIC_URLS[idx], headers={'User-Agent': 'TrendPulse/1.0'})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            with open(cached, 'wb') as f:
-                f.write(resp.read())
-        return cached
+        return generate_local_bg_music(fallback)
     except Exception as e:
-        print(f'Background music download failed: {e}')
+        print(f'Local background music generation failed: {e}')
         return None
 
 
 def download_background_video(topic):
-    """Download background B-roll via yt-dlp with improved search queries."""
+    """Download background B-roll via yt-dlp and verify the file exists before returning."""
     print(f'Downloading background video for: {topic}')
 
-    # More specific, higher quality search mappings
     search_terms = {
         'bitcoin': 'cryptocurrency trading screen close up 4k',
         'crypto': 'digital currency blockchain visualization 4k',
@@ -68,49 +109,73 @@ def download_background_video(topic):
         'climate': 'nature environmental earth from space 4k',
     }
 
-    search_query = 'cinematic drone footage 4k city aerial'
     topic_lower = topic.lower()
+    search_query = 'cinematic drone footage 4k city aerial'
     for keyword, query in search_terms.items():
         if keyword in topic_lower:
             search_query = query
             break
 
-    # Add randomness to avoid same clips
     suffixes = ['vertical', 'aesthetic', 'cinematic background', 'no copyright']
-    search_query += ' ' + random.choice(suffixes)
+    primary_query = search_query + ' ' + random.choice(suffixes)
 
     safe_name = topic_lower[:20].replace(' ', '_').replace('"', '').replace("'", '')
     output_path = f'/tmp/bg_{safe_name}_{random.randint(100,999)}.mp4'
 
-    # Skip download if recent cached version exists
     import glob
     cached = glob.glob(f'/tmp/bg_{safe_name}_*.mp4')
     if cached and os.path.getsize(cached[0]) > 100000:
         print(f'Using cached: {cached[0]}')
         return cached[0]
 
-    try:
-        subprocess.run([
-            '/home/daniel/.local/bin/yt-dlp',
-            f'ytsearch3:{search_query}',
-            '--playlist-items', str(random.randint(1, 3)),
-            '-f', 'bestvideo[ext=mp4][height<=1080]',
-            '-o', output_path,
-            '--reject-title', 'minecraft|parkour|GTA|gameplay|mobile game|subway surfers|compilation',
-            '--no-playlist',
-            '--max-filesize', '50M'
-        ], check=True, timeout=120)
-    except Exception as e:
-        print(f'yt-dlp failed: {e}, trying fallback query...')
-        subprocess.run([
-            '/home/daniel/.local/bin/yt-dlp',
-            'ytsearch1:cinematic 4k background no copyright vertical',
-            '-f', 'bestvideo[ext=mp4][height<=1080]',
-            '-o', output_path,
-            '--no-playlist'
-        ], check=True, timeout=120)
+    reject_pattern = 'minecraft|parkour|GTA|gameplay|mobile game|subway surfers|compilation'
 
-    return output_path
+    def cleanup_partial_files():
+        for suffix in ('', '.part'):
+            candidate = output_path + suffix
+            if os.path.exists(candidate):
+                os.remove(candidate)
+
+    def try_download(search_spec, reject_title=None):
+        cleanup_partial_files()
+        cmd = [
+            '/home/daniel/.local/bin/yt-dlp',
+            search_spec,
+            '--js-runtimes', 'node:/usr/bin/node',
+            '--remote-components', 'ejs:github',
+            '-f', 'bestvideo[ext=mp4][height<=480]/bestvideo[height<=480]/best[ext=mp4][height<=480]/best[height<=480]',
+            '-o', output_path,
+            '--max-filesize', '50M',
+            '--max-downloads', '1',
+            '--no-playlist',
+        ]
+        if reject_title:
+            cmd.extend(['--reject-title', reject_title])
+        try:
+            subprocess.run(cmd, check=True, timeout=120)
+        except subprocess.CalledProcessError as exc:
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 100000:
+                print(f'yt-dlp exited with {exc.returncode} after writing a usable file; continuing with {output_path}')
+                return True
+            raise
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 100000
+
+    attempts = [
+        (f'ytsearch10:{primary_query}', reject_pattern),
+        ('ytsearch10:vertical cinematic 4k background no copyright', reject_pattern),
+        ('ytsearch5:cinematic drone footage vertical 4k', None),
+    ]
+
+    for index, (search_spec, reject_title) in enumerate(attempts, start=1):
+        try:
+            print(f'yt-dlp attempt {index}: {search_spec}')
+            if try_download(search_spec, reject_title):
+                return output_path
+            print(f'yt-dlp attempt {index} produced no usable file, retrying...')
+        except Exception as e:
+            print(f'yt-dlp attempt {index} failed: {e}')
+
+    raise FileNotFoundError(f'No usable background video was downloaded for topic: {topic}')
 
 
 def transcribe_audio(audio_path):
@@ -142,20 +207,32 @@ def transcribe_audio(audio_path):
     return data
 
 
-def create_ass_subtitles(whisper_data, output_path):
-    """Create modern word-by-word subtitles — bold, chunked, colored highlight."""
+def create_ass_subtitles(whisper_data, output_path, layout='option1'):
+    """Create modern word-by-word subtitles with layout-aware placement."""
     print('Creating modern subtitles (word-by-word, 2-3 word chunks)...')
 
-    # Modern style: bold white text, colored active word, black outline, bottom-center
-    ass_header = """[Script Info]
+    if layout == 'option2':
+        font_size = 72
+        margin_v = 0
+        alignment = 5
+        outline = 3
+        shadow = 1
+    else:
+        font_size = 80
+        margin_v = 250
+        alignment = 5
+        outline = 4
+        shadow = 2
+
+    ass_header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Montserrat,80,&H00FFFFFF,&H0000FFFF,&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,4,2,5,40,40,250,1
-Style: Active,Montserrat,80,&H0000DDFF,&H0000FFFF,&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,4,2,5,40,40,250,1
+Style: Default,Montserrat,{font_size},&H00FFFFFF,&H0000FFFF,&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,{outline},{shadow},{alignment},40,40,{margin_v},1
+Style: Active,Montserrat,{font_size},&H0000DDFF,&H0000FFFF,&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,{outline},{shadow},{alignment},40,40,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -171,7 +248,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     events = []
     all_words = []
 
-    # Collect all words with timestamps
     for segment in whisper_data.get('segments', []):
         for word_data in segment.get('words', []):
             w = word_data.get('word', '').strip()
@@ -182,22 +258,27 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     'end': word_data['end']
                 })
 
-    # Chunk into groups of 2-3 words
     chunk_size = 3
+    hold_after_chunk = 0.18
     for i in range(0, len(all_words), chunk_size):
         chunk = all_words[i:i + chunk_size]
-        chunk_start = chunk[0]['start']
-        chunk_end = chunk[-1]['end']
+        next_chunk = all_words[i + chunk_size:i + (chunk_size * 2)]
+        next_chunk_start = next_chunk[0]['start'] if next_chunk else None
 
-        # For each word in the chunk, create a frame where that word is highlighted
         for j, active_word in enumerate(chunk):
             w_start = active_word['start']
-            w_end = active_word['end'] if j < len(chunk) - 1 else chunk_end
+            if j < len(chunk) - 1:
+                w_end = chunk[j + 1]['start']
+            elif next_chunk_start is not None and next_chunk_start - active_word['end'] <= 0.45:
+                w_end = next_chunk_start
+            else:
+                w_end = active_word['end'] + hold_after_chunk
+
+            w_end = max(w_end, w_start + 0.08)
 
             parts = []
             for k, w in enumerate(chunk):
                 if k == j:
-                    # Active word: yellow/gold color, slightly larger
                     parts.append('{\\c&H00DDFF&\\fscx110\\fscy110}' + w['word'] + '{\\c&HFFFFFF&\\fscx100\\fscy100}')
                 else:
                     parts.append(w['word'])
@@ -209,14 +290,24 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         f.write(ass_header)
         f.write('\n'.join(events))
 
+
     print(f'Subtitles: {len(events)} events from {len(all_words)} words')
 
 
-def assemble_video(audio_path, background_path, subtitles_path, output_path, bg_music_path=None):
-    """Assemble final video with background music, modern subs, and optimized encoding."""
+def escape_filter_path(path_value):
+    return (path_value
+        .replace('\\', '\\\\')
+        .replace(':', '\\:')
+        .replace(',', '\\,')
+        .replace('[', '\\[')
+        .replace(']', '\\]')
+        .replace("'", "\\'"))
+
+
+def assemble_video(audio_path, background_path, subtitles_path, output_path, bg_music_path=None, layout='option1', user_clip_path=None):
+    """Assemble the final video in either the standard or split layout."""
     print('Assembling final video...')
 
-    # Get audio duration
     result = subprocess.run([
         'ffprobe', '-v', 'quiet', '-print_format', 'json',
         '-show_format', audio_path
@@ -224,37 +315,50 @@ def assemble_video(audio_path, background_path, subtitles_path, output_path, bg_
     duration = float(json.loads(result.stdout)['format']['duration'])
     print(f'Audio duration: {duration:.1f}s')
 
-    # Build FFmpeg command
     inputs = [
         '-stream_loop', '-1', '-i', background_path,
         '-i', audio_path,
     ]
 
-    filter_parts = []
-    audio_mix = '[1:a]'
+    user_clip_index = None
+    if layout == 'option2':
+        if not user_clip_path or not os.path.exists(user_clip_path):
+            raise FileNotFoundError('Option 2 requires a valid user clip path')
+        inputs.extend(['-stream_loop', '-1', '-i', user_clip_path])
+        user_clip_index = 2
 
+    music_index = None
     if bg_music_path and os.path.exists(bg_music_path):
+        music_index = sum(1 for token in inputs if token == '-i')
         inputs.extend(['-stream_loop', '-1', '-i', bg_music_path])
-        # Mix voiceover (loud) with bg music (quiet) — music at 12% volume
-        filter_parts.append('[2:a]volume=0.12[bgm]')
-        filter_parts.append('[1:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[aout]')
-        audio_mix = '[aout]'
-    
-    # Video filter: scale to 9:16, crop, burn subtitles
-    vf = f'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,ass={subtitles_path}'
 
-    filter_complex = ';'.join(filter_parts) if filter_parts else None
+    subtitle_filter_path = escape_filter_path(subtitles_path)
+    filter_parts = []
 
-    cmd = ['ffmpeg', '-y'] + inputs + ['-t', str(duration)]
-
-    if filter_complex:
-        cmd.extend(['-filter_complex', filter_complex])
-        cmd.extend(['-vf', vf])
-        cmd.extend(['-map', '0:v', '-map', audio_mix])
+    if layout == 'option2':
+        split_height = 780
+        band_height = 360
+        filter_parts.extend([
+            f'[0:v]scale=1080:{split_height}:force_original_aspect_ratio=increase,crop=1080:{split_height}[topv]',
+            f'[{user_clip_index}:v]scale=1080:{split_height}:force_original_aspect_ratio=increase,crop=1080:{split_height}[bottomv]',
+            f'color=c=black@0.72:s=1080x{band_height}:d={duration}[band]',
+            '[topv][band][bottomv]vstack=inputs=3[stacked]',
+            f'[stacked]ass={subtitle_filter_path}[vout]',
+        ])
     else:
-        cmd.extend(['-vf', vf])
+        filter_parts.append(f'[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,ass={subtitle_filter_path}[vout]')
 
-    cmd.extend([
+    audio_out = '[1:a]'
+    if music_index is not None:
+        filter_parts.append(f'[{music_index}:a]volume=0.12[bgm]')
+        filter_parts.append('[1:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[aout]')
+        audio_out = '[aout]'
+
+    cmd = ['ffmpeg', '-y'] + inputs + [
+        '-t', str(duration),
+        '-filter_complex', ';'.join(filter_parts),
+        '-map', '[vout]',
+        '-map', audio_out,
         '-c:v', 'libx264',
         '-preset', 'medium',
         '-crf', '20',
@@ -265,7 +369,7 @@ def assemble_video(audio_path, background_path, subtitles_path, output_path, bg_
         '-shortest',
         '-movflags', '+faststart',
         output_path
-    ])
+    ]
 
     print('Running FFmpeg...')
     subprocess.run(cmd, check=True)
@@ -275,14 +379,31 @@ def assemble_video(audio_path, background_path, subtitles_path, output_path, bg_
 
 
 if __name__ == '__main__':
-    audio_path = sys.argv[1]
-    output_path = sys.argv[2] if len(sys.argv) > 2 else '/tmp/final_video.mp4'
-    topic = sys.argv[3] if len(sys.argv) > 3 else 'general'
+    if len(sys.argv) > 1 and not sys.argv[1].startswith('--'):
+        audio_path = sys.argv[1]
+        output_path = sys.argv[2] if len(sys.argv) > 2 else '/tmp/final_video.mp4'
+        topic = sys.argv[3] if len(sys.argv) > 3 else 'general'
+        layout = 'option1'
+        user_clip_path = None
+    else:
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--audio', required=True)
+        parser.add_argument('--output', default='/tmp/final_video.mp4')
+        parser.add_argument('--topic', default='general')
+        parser.add_argument('--layout', choices=['option1', 'option2'], default='option1')
+        parser.add_argument('--user-clip', dest='user_clip_path')
+        args = parser.parse_args()
+        audio_path = args.audio
+        output_path = args.output
+        topic = args.topic
+        layout = args.layout
+        user_clip_path = args.user_clip_path
 
     background_path = download_background_video(topic)
     subtitles_path = '/tmp/subtitles.ass'
     bg_music_path = download_bg_music()
 
     whisper_data = transcribe_audio(audio_path)
-    create_ass_subtitles(whisper_data, subtitles_path)
-    assemble_video(audio_path, background_path, subtitles_path, output_path, bg_music_path)
+    create_ass_subtitles(whisper_data, subtitles_path, layout=layout)
+    assemble_video(audio_path, background_path, subtitles_path, output_path, bg_music_path, layout=layout, user_clip_path=user_clip_path)
+
