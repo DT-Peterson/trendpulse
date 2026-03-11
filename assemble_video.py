@@ -208,16 +208,16 @@ def transcribe_audio(audio_path):
 
 
 def create_ass_subtitles(whisper_data, output_path, layout='option1'):
-    """Create modern word-by-word subtitles with layout-aware placement."""
-    print('Creating modern subtitles (word-by-word, 2-3 word chunks)...')
-
+    """Create layout-aware ASS subtitles."""
     if layout == 'option2':
-        font_size = 72
+        print('Creating Option 2 subtitles (single word, center overlay)...')
+        font_size = 64
         margin_v = 0
         alignment = 5
-        outline = 3
+        outline = 5
         shadow = 1
     else:
+        print('Creating Option 1 subtitles (word-by-word, 2-3 word chunks)...')
         font_size = 80
         margin_v = 250
         alignment = 5
@@ -231,8 +231,8 @@ PlayResY: 1920
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Montserrat,{font_size},&H00FFFFFF,&H0000FFFF,&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,{outline},{shadow},{alignment},40,40,{margin_v},1
-Style: Active,Montserrat,{font_size},&H0000DDFF,&H0000FFFF,&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,{outline},{shadow},{alignment},40,40,{margin_v},1
+Style: Default,Montserrat,{font_size},&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,{outline},{shadow},{alignment},40,40,{margin_v},1
+Style: Active,Montserrat,{font_size},&H0000DDFF,&H0000FFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,{outline},{shadow},{alignment},40,40,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -258,38 +258,50 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     'end': word_data['end']
                 })
 
-    chunk_size = 3
-    hold_after_chunk = 0.18
-    for i in range(0, len(all_words), chunk_size):
-        chunk = all_words[i:i + chunk_size]
-        next_chunk = all_words[i + chunk_size:i + (chunk_size * 2)]
-        next_chunk_start = next_chunk[0]['start'] if next_chunk else None
-
-        for j, active_word in enumerate(chunk):
-            w_start = active_word['start']
-            if j < len(chunk) - 1:
-                w_end = chunk[j + 1]['start']
-            elif next_chunk_start is not None and next_chunk_start - active_word['end'] <= 0.45:
-                w_end = next_chunk_start
+    if layout == 'option2':
+        hold_after_word = 0.06
+        for idx, word in enumerate(all_words):
+            w_start = word['start']
+            next_start = all_words[idx + 1]['start'] if idx + 1 < len(all_words) else None
+            if next_start is not None:
+                w_end = next_start
             else:
-                w_end = active_word['end'] + hold_after_chunk
-
-            w_end = max(w_end, w_start + 0.08)
-
-            parts = []
-            for k, w in enumerate(chunk):
-                if k == j:
-                    parts.append('{\\c&H00DDFF&\\fscx110\\fscy110}' + w['word'] + '{\\c&HFFFFFF&\\fscx100\\fscy100}')
-                else:
-                    parts.append(w['word'])
-
-            line = ' '.join(parts)
+                w_end = word['end'] + hold_after_word
+            w_end = max(w_end, w_start + 0.06)
+            line = '{\\c&H00DDFF&\\fscx108\\fscy108}' + word['word'] + '{\\c&HFFFFFF&\\fscx100\\fscy100}'
             events.append(f'Dialogue: 0,{fmt(w_start)},{fmt(w_end)},Default,,0,0,0,,{line}')
+    else:
+        chunk_size = 3
+        hold_after_chunk = 0.18
+        for i in range(0, len(all_words), chunk_size):
+            chunk = all_words[i:i + chunk_size]
+            next_chunk = all_words[i + chunk_size:i + (chunk_size * 2)]
+            next_chunk_start = next_chunk[0]['start'] if next_chunk else None
+
+            for j, active_word in enumerate(chunk):
+                w_start = active_word['start']
+                if j < len(chunk) - 1:
+                    w_end = chunk[j + 1]['start']
+                elif next_chunk_start is not None and next_chunk_start - active_word['end'] <= 0.45:
+                    w_end = next_chunk_start
+                else:
+                    w_end = active_word['end'] + hold_after_chunk
+
+                w_end = max(w_end, w_start + 0.08)
+
+                parts = []
+                for k, w in enumerate(chunk):
+                    if k == j:
+                        parts.append('{\\c&H00DDFF&\\fscx110\\fscy110}' + w['word'] + '{\\c&HFFFFFF&\\fscx100\\fscy100}')
+                    else:
+                        parts.append(w['word'])
+
+                line = ' '.join(parts)
+                events.append(f'Dialogue: 0,{fmt(w_start)},{fmt(w_end)},Default,,0,0,0,,{line}')
 
     with open(output_path, 'w') as f:
         f.write(ass_header)
         f.write('\n'.join(events))
-
 
     print(f'Subtitles: {len(events)} events from {len(all_words)} words')
 
@@ -359,13 +371,11 @@ def assemble_video(audio_path, background_path, subtitles_path, output_path, bg_
     filter_parts = []
 
     if layout == 'option2':
-        split_height = 780
-        band_height = 360
+        split_height = 960
         filter_parts.extend([
             f'[0:v]scale=1080:{split_height}:force_original_aspect_ratio=increase,crop=1080:{split_height}[topv]',
             f'[{user_clip_index}:v]scale=1080:{split_height}:force_original_aspect_ratio=increase,crop=1080:{split_height}[bottomv]',
-            f'color=c=black@0.72:s=1080x{band_height}:d={duration}[band]',
-            '[topv][band][bottomv]vstack=inputs=3[stacked]',
+            '[topv][bottomv]vstack=inputs=2[stacked]',
             f'[stacked]ass={subtitle_filter_path}[vout]',
         ])
     else:
@@ -429,4 +439,5 @@ if __name__ == '__main__':
     whisper_data = transcribe_audio(audio_path)
     create_ass_subtitles(whisper_data, subtitles_path, layout=layout)
     assemble_video(audio_path, background_path, subtitles_path, output_path, bg_music_path, layout=layout, user_clip_path=user_clip_path)
+
 
