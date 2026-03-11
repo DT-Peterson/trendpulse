@@ -235,20 +235,24 @@ SCRIPT RULES:
 function sanitizeScript(script, topic) {
   const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const escapedTopic = escapeRegex(topic);
-  const topicOnly = new RegExp(`^\\s*["'()\\[\\]#>*-]*${escapedTopic}["'()\\[\\]#>*-]*\\s*$`, 'i');
-  const labelLine = /^(hook|topic|title|script|voiceover|caption)\\s*[:.-]?\\s*/i;
+  const topicOnly = new RegExp(`^\\s*["'*_()\\[\\]#>*-]*${escapedTopic}["'*_()\\[\\]#>*-]*\\s*$`, 'i');
+  const labelOnly = /^[>*\-\s"'`*_()\[\]]*(hook|topic|title|script|voiceover|caption)[>*\-\s"'`*_()\[\]]*[:.-]*\s*$/i;
+  const labelPrefix = /^[>*\-\s"'`*_()\[\]]*(hook|topic|title|script|voiceover|caption)\s*[:.-]?\s*/i;
 
   const cleanedLines = script
     .split(/\r?\n/)
     .map((line) => line.trim())
+    .map((line) => line.replace(/^[-*#>]+\s*/, '').replace(/\*\*/g, '').trim())
     .filter((line) => line.length > 0)
-    .map((line) => line.replace(labelLine, '').trim())
+    .filter((line) => !labelOnly.test(line))
+    .map((line) => line.replace(labelPrefix, '').trim())
     .filter((line) => line.length > 0)
     .filter((line) => !topicOnly.test(line));
 
   let cleaned = cleanedLines.join('\n');
-  cleaned = cleaned.replace(/^(hook|topic|title|script|voiceover|caption)\b[.: -]*/i, '');
+  cleaned = cleaned.replace(labelPrefix, '');
   cleaned = cleaned.replace(/^about\s*:\s*/i, '');
+  cleaned = cleaned.replace(/^\s*["'`*_()\[\]#>*-]*(hook|topic|title|script|voiceover|caption)["'`*_()\[\]#>*-]*\s*/i, '');
   cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
 
   if (!cleaned) {
@@ -293,7 +297,7 @@ async function generateVoiceover(script, topic) {
   console.log(`Using voice: ${voice.name} (${voice.style}) for topic: ${topic}`);
 
   // Strip [pause] markers — ElevenLabs handles pacing via SSML-like breaks
-  const cleanScript = script.replace(/\[pause\]/gi, '... ');
+  const cleanScript = sanitizeScript(script, topic).replace(/\[pause\]/gi, '... ');
 
   const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voice.id}`, {
     method: 'POST',
@@ -536,4 +540,5 @@ module.exports = {
   sanitizeScript,
   assembleVideo
 };
+
 

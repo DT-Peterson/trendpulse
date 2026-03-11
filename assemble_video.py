@@ -304,6 +304,28 @@ def escape_filter_path(path_value):
         .replace("'", "\\'"))
 
 
+
+def has_video_stream(path_value):
+    result = subprocess.run([
+        'ffprobe', '-v', 'quiet', '-print_format', 'json',
+        '-show_streams', path_value
+    ], capture_output=True, text=True)
+    if result.returncode != 0:
+        return False
+    data = json.loads(result.stdout or '{}')
+    return any(stream.get('codec_type') == 'video' for stream in data.get('streams', []))
+
+
+def validate_option2_sources(background_path, user_clip_path):
+    if not user_clip_path or not os.path.exists(user_clip_path):
+        raise FileNotFoundError('Option 2 requires a valid user clip path')
+    if os.path.realpath(background_path) == os.path.realpath(user_clip_path):
+        raise ValueError('Option 2 requires two separate videos: generated top and user bottom clip')
+    if not has_video_stream(background_path):
+        raise ValueError(f'Generated top clip is missing a video stream: {background_path}')
+    if not has_video_stream(user_clip_path):
+        raise ValueError(f'User clip is missing a video stream: {user_clip_path}')
+
 def assemble_video(audio_path, background_path, subtitles_path, output_path, bg_music_path=None, layout='option1', user_clip_path=None):
     """Assemble the final video in either the standard or split layout."""
     print('Assembling final video...')
@@ -322,8 +344,9 @@ def assemble_video(audio_path, background_path, subtitles_path, output_path, bg_
 
     user_clip_index = None
     if layout == 'option2':
-        if not user_clip_path or not os.path.exists(user_clip_path):
-            raise FileNotFoundError('Option 2 requires a valid user clip path')
+        validate_option2_sources(background_path, user_clip_path)
+        print(f'Option 2 top clip: {background_path}')
+        print(f'Option 2 bottom clip: {user_clip_path}')
         inputs.extend(['-stream_loop', '-1', '-i', user_clip_path])
         user_clip_index = 2
 
